@@ -9,9 +9,14 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import dotenv from 'dotenv';
 
-dotenv.config({path: '../.env'});
+dotenv.config({ path: '../.env' });
 
 const PORT = Number(process.env.SIGNAL_PORT || process.env.PORT || 8082);
+
+// ✅ [2026-02-24] NEW: Ahri API proxy settings (apiKey는 서버에서만 보관/주입)
+const AHRIRAG_API_BASE = String(process.env.AHRIRAG_API_BASE || 'https://api.ahrirag.com').replace(/\/+$/, '');
+const AHRIRAG_API_KEY = String(process.env.AHRIRAG_API_KEY || '').trim();
+const AHRIRAG_MODEL_FAMILY = String(process.env.AHRIRAG_MODEL_FAMILY || '').trim();
 
 // ─────────────────────────────────────────────────────────
 // PostgreSQL
@@ -24,6 +29,20 @@ const query = (sql, params) => pool.query(sql, params);
 async function ping() {
   const r = await query('select 1 as ok');
   return r.rows[0]?.ok === 1;
+}
+
+// ─────────────────────────────────────────────────────────
+// ✅ JWT 토큰 파싱 유틸 (⚠️ 아래 라우트들에서 먼저 쓰이므로 위로 올림)  ✅ [2026-02-25] FIX
+// ─────────────────────────────────────────────────────────
+function verifyTokenFromReq(req) {
+  try {
+    const h = req.headers.authorization || req.headers.Authorization || '';
+    const [typ, tk] = String(h).split(' ');
+    if (typ?.toLowerCase() !== 'bearer' || !tk) return null;
+    return jwt.verify(tk, process.env.JWT_SECRET);
+  } catch {
+    return null;
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -62,6 +81,38 @@ const maskEmail = (email = '') => {
   return `${mLocal}@${mDom}${tld ? '.' + tld : ''}`;
 };
 
+// ✅ [2026-02-12] NEW: 담당고객 상한(기본 200명). 과금 확장 시 env로 올릴 수 있게.
+const CUSTOMER_LIMIT_PER_PLANNER = Number(process.env.CUSTOMER_LIMIT_PER_PLANNER || 200);
+
+// ✅ [2026-02-12] NEW: 고객 기본 저장용량(MB). DB default가 있으면 이 값은 무시해도 됨(하지만 안전하게 세팅).
+const DEFAULT_USER_FILE_MB = Number(process.env.DEFAULT_USER_FILE_MB || 10);
+
+// ✅ [2026-02-12] NEW: plannerNo(=users.user_no of planner)에 대한 담당 고객 수 제한 체크 (트랜잭션 + 잠금)
+// - 동시성에서 200명 초과 삽입이 발생하지 않도록 planner row를 FOR UPDATE로 잠금
+async function enforcePlannerCustomerLimitTx(client, plannerNoInt, limit = CUSTOMER_LIMIT_PER_PLANNER) {
+  const rLock = await client.query(
+    `SELECT id, user_no, role FROM users WHERE role='planner' AND user_no=$1 LIMIT 1 FOR UPDATE`,
+    [plannerNoInt],
+  );
+  if (!rLock.rowCount) {
+    const err = new Error('INVALID_PLANNER_NO');
+    err.code = 'INVALID_PLANNER_NO';
+    throw err;
+  }
+
+  const rCount = await client.query(`SELECT COUNT(*)::int AS cnt FROM users WHERE role='user' AND planner_no=$1`, [
+    plannerNoInt,
+  ]);
+
+  const cnt = Number(rCount.rows[0]?.cnt ?? 0);
+  if (cnt >= limit) {
+    const err = new Error('CUSTOMER_LIMIT_EXCEEDED');
+    err.code = 'CUSTOMER_LIMIT_EXCEEDED';
+    err.detail = { cnt, limit };
+    throw err;
+  }
+}
+
 // ─────────────────────────────────────────────────────────
 // HTTP (REST + POP 큐)
 // ─────────────────────────────────────────────────────────
@@ -78,6 +129,10 @@ app.use((req, res, next) => {
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  // ✅ [2026-02-10] FIX: credentials 포함 요청(preflight) 호환
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -91,9 +146,138 @@ app.get('/health', async (_req, res) => {
   }
 });
 
+// ✅ [2026-02-24] NEW: Ahri init 프록시
+app.post('/auth/ahri', async (req, res) => {
+  try {
+    if (!AHRIRAG_API_KEY) {
+      return res.status(500).json({ ok: false, error: 'AHRIRAG_API_KEY_missing' });
+    }
+
+    const _fetch = globalThis.fetch;
+    if (typeof _fetch !== 'function') {
+      return res
+        .status(500)
+        .json({ ok: false, error: 'FETCH_NOT_AVAILABLE(Node18+ required or add node-fetch)' });
+    }
+
+    const body = req.body ?? {};
+    let finalUserId = String(body.userId || '').trim();
+
+    const payload = verifyTokenFromReq(req);
+    if (payload?.sub) {
+      const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
+      if (meRes.rowCount) {
+        const me = meRes.rows[0];
+        if (me.role === 'user') finalUserId = `ahrisure_customer_${me.user_no}`;
+        else if (me.role === 'manager') finalUserId = `ahrisure_manager_${me.user_no}`;
+        else if (me.role === 'planner') finalUserId = `ahrisure_planner_${me.user_no}`;
+        else finalUserId = `ahrisure_${me.role}_${me.user_no}`;
+      }
+    }
+
+    if (!finalUserId) return res.status(400).json({ ok: false, error: 'userId_required' });
+
+    const url = `${AHRIRAG_API_BASE}/init/ahri`;
+
+    const forward1 = {
+      ...body,
+      userId: finalUserId,
+      apiKey: AHRIRAG_API_KEY,
+      modelFamily: AHRIRAG_MODEL_FAMILY || String(body.modelFamily || ''),
+    };
+
+    const r1 = await _fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(forward1),
+    });
+
+    if (r1.status === 422) {
+      const forward2 = { userId: finalUserId };
+      const r2 = await _fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(forward2),
+      });
+
+      const t2 = await r2.text();
+      res.status(r2.status);
+      const ct2 = r2.headers.get('content-type');
+      if (ct2) res.setHeader('content-type', ct2);
+      return res.send(t2);
+    }
+
+    const t1 = await r1.text();
+    res.status(r1.status);
+    const ct1 = r1.headers.get('content-type');
+    if (ct1) res.setHeader('content-type', ct1);
+    return res.send(t1);
+  } catch (e) {
+    console.error('[auth/ahri]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// ✅ [2026-02-24] NEW: Ahri update 프록시
+app.post('/auth/ahri/update', async (req, res) => {
+  try {
+    if (!AHRIRAG_API_KEY) {
+      return res.status(500).json({ ok: false, error: 'AHRIRAG_API_KEY_missing' });
+    }
+
+    const _fetch = globalThis.fetch;
+    if (typeof _fetch !== 'function') {
+      return res
+        .status(500)
+        .json({ ok: false, error: 'FETCH_NOT_AVAILABLE(Node18+ required or add node-fetch)' });
+    }
+
+    const body = req.body ?? {};
+    let finalUserId = String(body.userId || '').trim();
+
+    const payload = verifyTokenFromReq(req);
+    if (payload?.sub) {
+      const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
+      if (meRes.rowCount) {
+        const me = meRes.rows[0];
+        if (me.role === 'user') finalUserId = `ahrisure_customer_${me.user_no}`;
+        else if (me.role === 'manager') finalUserId = `ahrisure_manager_${me.user_no}`;
+        else if (me.role === 'planner') finalUserId = `ahrisure_planner_${me.user_no}`;
+        else finalUserId = `ahrisure_${me.role}_${me.user_no}`;
+      }
+    }
+
+    if (!finalUserId) return res.status(400).json({ ok: false, error: 'userId_required' });
+
+    const url = `${AHRIRAG_API_BASE}/update/ahri`;
+
+    const forward = {
+      ...body,
+      userId: finalUserId,
+      apiKey: AHRIRAG_API_KEY,
+      modelFamily: AHRIRAG_MODEL_FAMILY || String(body.modelFamily || ''),
+    };
+
+    const r = await _fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(forward),
+    });
+
+    const t = await r.text();
+    res.status(r.status);
+    const ct = r.headers.get('content-type');
+    if (ct) res.setHeader('content-type', ct);
+    return res.send(t);
+  } catch (e) {
+    console.error('[auth/ahri/update]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
 // 인메모리 큐
 const messages = new Map();
-app.post('/messages', (req, res) => {
+app.post('/auth/messages', (req, res) => {
   const { roomId, to, msg } = req.body || {};
   if (!roomId || !to || !msg || !msg.text) {
     return res.status(400).json({ ok: false, error: 'roomId/to/msg.text required' });
@@ -105,7 +289,7 @@ app.post('/messages', (req, res) => {
   else return res.status(400).json({ ok: false, error: 'to must be user|manager' });
   return res.json({ ok: true });
 });
-app.get('/messages', (req, res) => {
+app.get('/auth/messages', (req, res) => {
   const { roomId, for: forWho } = req.query;
   if (!roomId || !forWho) return res.status(400).json({ ok: false, error: 'roomId & for required' });
   if (!messages.has(roomId)) return res.json({ ok: true, messages: [] });
@@ -114,56 +298,319 @@ app.get('/messages', (req, res) => {
   const out = list.splice(0, list.length);
   return res.json({ ok: true, messages: out });
 });
-app.get('/debug/messages', (req, res) => {
+app.get('/auth/debug/messages', (req, res) => {
   const { roomId } = req.query;
   const box = messages.get(roomId) || { toUser: [], toManager: [] };
   res.json({ ok: true, debug: { roomId, toUser: box.toUser, toManager: box.toManager } });
 });
 
-// sizeBytes: 실제 파일 크기(바이트 단위)
-// userId: 이 용량을 차지할 "사용자"의 users.id
+// ─────────────────────────────────────────────────────────
+// Quota: 업로드/삭제 used_bytes 조정
+// ─────────────────────────────────────────────────────────
+
 // 파일 업로드 전 용량 체크 + used_bytes 증가
-app.post('/files/upload', async (req, res) => {
+app.post('/auth/files/upload', async (req, res) => {
   try {
     const payload = verifyTokenFromReq(req);
-    if (!payload?.sub) {
-      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const { sizeBytes, targetUserNo } = req.body ?? {};
+    if (!sizeBytes) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+
+    let deltaMB = Number(sizeBytes) / (1024 ** 2);
+    if (deltaMB < 0.001) deltaMB = 0.001;
+    const delta = Number(deltaMB.toFixed(3));
+
+    const tNoRaw = targetUserNo !== undefined && targetUserNo !== null ? Number(String(targetUserNo).trim()) : NaN;
+    const hasTargetUserNo = Number.isFinite(tNoRaw) && tNoRaw > 0;
+
+    const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
+    if (!meRes.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+    const me = meRes.rows[0];
+
+    let r;
+    if (!hasTargetUserNo) {
+      r = await query(
+        `
+        UPDATE users
+        SET used_bytes = COALESCE(used_bytes, 0) + $2
+        WHERE id = $1
+          AND COALESCE(used_bytes, 0) + $2 <= COALESCE(file_bytes, 0)
+        RETURNING id, used_bytes, file_bytes
+        `,
+        [payload.sub, delta],
+      );
+    } else {
+      if (me.role === 'planner') {
+        r = await query(
+          `
+          UPDATE users
+          SET used_bytes = COALESCE(used_bytes, 0) + $2
+          WHERE role = 'user'
+            AND user_no = $1
+            AND planner_no = $3
+            AND COALESCE(used_bytes, 0) + $2 <= COALESCE(file_bytes, 0)
+          RETURNING id, used_bytes, file_bytes
+          `,
+          [tNoRaw, delta, me.user_no],
+        );
+      } else if (me.role === 'admin' || me.role === 'manager') {
+        r = await query(
+          `
+          UPDATE users
+          SET used_bytes = COALESCE(used_bytes, 0) + $2
+          WHERE role = 'user'
+            AND user_no = $1
+            AND COALESCE(used_bytes, 0) + $2 <= COALESCE(file_bytes, 0)
+          RETURNING id, used_bytes, file_bytes
+          `,
+          [tNoRaw, delta],
+        );
+      } else {
+        return res.status(403).json({ ok: false, error: 'FORBIDDEN_ROLE' });
+      }
     }
+
+    if (!r.rowCount) return res.status(400).json({ ok: false, error: 'QUOTA_EXCEEDED' });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[files/upload]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+/**
+ * ✅ [2026-02-25] NEW: 삭제 시 used_bytes 감소(차감)
+ * - body: { sizeBytes }
+ */
+app.post('/auth/files/delete', async (req, res) => {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 
     const { sizeBytes } = req.body ?? {};
-    if (!sizeBytes) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
+    const b = Number(sizeBytes ?? 0);
+    if (!Number.isFinite(b) || b <= 0) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
 
-    // 1) 바이트 → GB (실수)
-    let deltaGB = sizeBytes / (1024 ** 3);  // 예: 4KB → 0.0000037...
-
-    // 2) 0.001GB 미만은 0.001로 클램프
-    if (deltaGB < 0.001) {
-      deltaGB = 0.001;
-    }
-
-    // 3) 소수점 3자리까지로 잘라서 넘기기 (DB는 numeric(12,3))
-    const delta = Number(deltaGB.toFixed(3)); // 0.001, 1.234, 9.876 등
+    let deltaMB = b / (1024 ** 2);
+    if (deltaMB < 0.001) deltaMB = 0.001;
+    const delta = Number(deltaMB.toFixed(3));
 
     const r = await query(
       `
       UPDATE users
-      SET used_bytes = used_bytes + $2
+      SET used_bytes = GREATEST(0, COALESCE(used_bytes, 0) - $2)
       WHERE id = $1
-        AND used_bytes + $2 <= file_bytes
-      RETURNING id, used_bytes, file_bytes
+      RETURNING id, user_no, file_bytes, used_bytes
       `,
-      [payload.sub, delta]
+      [payload.sub, delta],
     );
 
-    if (!r.rowCount) {
-      return res.status(400).json({ ok: false, error: 'QUOTA_EXCEEDED' });
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+    return res.json({ ok: true, me: r.rows[0] });
+  } catch (e) {
+    console.error('[files/delete]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+/**
+ * ✅ [2026-02-25] NEW: 업로드 파일 메타데이터 기록(삭제 시 sizeBytes 조회용)
+ *
+ * 프론트(api.tsx)의 recordFilesAfterUpload()는
+ * POST /auth/files/record-upload  body: { files: [ ... ] }
+ * 형태로 보내므로, 서버도 그 형태를 그대로 받도록 수정함.  ✅ [2026-02-25] FIX
+ *
+ * DB: user_files 테이블 필요 (PK/UNIQUE: owner_user_id + collection_name + category_path + content_name)
+ */
+app.post('/auth/files/record-upload', async (req, res) => {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const body = req.body ?? {};
+    const filesRaw = Array.isArray(body.files)
+      ? body.files
+      : Array.isArray(body.items)
+        ? body.items
+        : body.collectionName && body.contentName
+          ? [body] // 단건 호환
+          : [];
+
+    if (!filesRaw.length) {
+      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
     }
 
-    return res.json({ ok: true });
+    const meRes = await query(`SELECT id, role, user_no FROM users WHERE id=$1 LIMIT 1`, [payload.sub]);
+    if (!meRes.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+    const me = meRes.rows[0];
+
+    // ✅ [2026-03-20] 공통 targetUserNo (body 최상단에 있는 경우)
+    const bodyTargetUserNo = body.targetUserNo != null ? Number(body.targetUserNo) : NaN;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let okCount = 0;
+      const bad = [];
+
+      for (let i = 0; i < filesRaw.length; i += 1) {
+        const f = filesRaw[i] ?? {};
+        const collectionName = String(f.collectionName ?? '').trim();
+        const categoryPath = String(f.categoryPath ?? '').trim(); // common은 '' 가능
+        const contentName = String(f.contentName ?? '').trim();
+        const mimeType = f.mimeType != null && String(f.mimeType).trim() !== '' ? String(f.mimeType).trim() : null;
+
+        const size = Number(f.sizeBytes ?? 0);
+        const sizeBytes = Number.isFinite(size) && size >= 0 ? Math.trunc(size) : null;
+
+        if (!collectionName || !contentName || sizeBytes == null) {
+          bad.push({ index: i, collectionName, categoryPath, contentName, sizeBytes: f.sizeBytes });
+          continue;
+        }
+
+        // ✅ [2026-03-20] targetUserNo 처리:
+        //   - 파일별 f.targetUserNo 우선, 없으면 body.targetUserNo, 없으면 요청자(me) 사용
+        //   - ahrisure_customer_M_N 컬렉션: 프론트가 고객 user_no를 targetUserNo로 전달
+        //   - ahrisure_manager_N 컬렉션: targetUserNo 미전달 → me(플래너 본인)로 기록
+        const itemTargetNo = f.targetUserNo != null ? Number(f.targetUserNo) : NaN;
+        const targetNo = Number.isFinite(itemTargetNo) && itemTargetNo > 0 ? itemTargetNo
+                       : Number.isFinite(bodyTargetUserNo) && bodyTargetUserNo > 0 ? bodyTargetUserNo
+                       : NaN;
+
+        let owner = me;
+        if (Number.isFinite(targetNo) && targetNo > 0 && targetNo !== me.user_no) {
+          const targetRes = await client.query(
+            `SELECT id, role, user_no FROM users WHERE user_no=$1 LIMIT 1`,
+            [targetNo],
+          );
+          if (targetRes.rowCount) {
+            owner = targetRes.rows[0];
+          }
+          // targetUserNo 지정됐지만 못 찾으면 me로 fallback (에러 대신 계속 진행)
+        }
+
+        await client.query(
+          `
+          INSERT INTO user_files
+            (owner_user_id, owner_user_no, owner_role, collection_name, category_path, content_name,
+             size_bytes, mime_type, uploaded_at, is_deleted, deleted_at)
+          VALUES
+            ($1,$2,$3,$4,$5,$6,$7,$8,now(),false,NULL)
+          ON CONFLICT (owner_user_id, collection_name, category_path, content_name)
+          DO UPDATE SET
+            size_bytes = EXCLUDED.size_bytes,
+            mime_type = EXCLUDED.mime_type,
+            uploaded_at = now(),
+            is_deleted = false,
+            deleted_at = NULL
+          `,
+          [owner.id, owner.user_no, owner.role, collectionName, categoryPath, contentName, sizeBytes, mimeType],
+        );
+
+        okCount += 1;
+      }
+
+      await client.query('COMMIT');
+
+      if (okCount === 0) {
+        return res.status(400).json({ ok: false, error: 'INVALID_INPUT', bad });
+      }
+
+      return res.json({ ok: true, count: okCount, bad });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
   } catch (e) {
-    console.error('[files/upload]', e);
+    console.error('[record-upload]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// GET /auth/files/record?collectionName=...&categoryPath=...&contentName=...
+app.get('/auth/files/record', async (req, res) => {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const collectionName = String(req.query.collectionName ?? '').trim();
+    const categoryPath = String(req.query.categoryPath ?? '').trim();
+    const contentName = String(req.query.contentName ?? '').trim();
+
+    if (!collectionName || !contentName) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+
+    const r = await query(
+      `
+      SELECT id, collection_name, category_path, content_name, size_bytes, mime_type, uploaded_at, is_deleted, deleted_at
+      FROM user_files
+      WHERE owner_user_id=$1
+        AND collection_name=$2
+        AND category_path=$3
+        AND content_name=$4
+      LIMIT 1
+      `,
+      [payload.sub, collectionName, categoryPath, contentName],
+    );
+
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+    return res.json({ ok: true, file: r.rows[0] });
+  } catch (e) {
+    console.error('[record-get]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// POST /auth/files/record-delete  { collectionName, categoryPath, contentName, userNo? }
+app.post('/auth/files/record-delete', async (req, res) => {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const { collectionName, categoryPath, contentName, userNo, targetUserNo } = req.body ?? {};
+    if (!collectionName || !contentName) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+
+    const col = String(collectionName).trim();
+    const cat = String(categoryPath ?? '').trim();
+    const name = String(contentName).trim();
+
+    // ✅ [2026-03-20] userNo(또는 targetUserNo) 제공 시 해당 사용자의 owner_user_id로 삭제
+    //   - ahrisure_customer_M_N: 프론트가 고객 user_no 전달
+    //   - ahrisure_manager_N: userNo 미전달 → JWT sub(플래너 본인)로 처리
+    const requestedNo = userNo != null ? Number(userNo) : targetUserNo != null ? Number(targetUserNo) : NaN;
+    let ownerUserId = payload.sub;
+
+    if (Number.isFinite(requestedNo) && requestedNo > 0) {
+      const targetRes = await query(
+        `SELECT id FROM users WHERE user_no=$1 LIMIT 1`,
+        [requestedNo],
+      );
+      if (targetRes.rowCount) {
+        ownerUserId = targetRes.rows[0].id;
+      }
+      // 못 찾으면 JWT sub로 fallback
+    }
+
+    const r = await query(
+      `
+      UPDATE user_files
+      SET is_deleted=true, deleted_at=now()
+      WHERE owner_user_id=$1
+        AND collection_name=$2
+        AND category_path=$3
+        AND content_name=$4
+      RETURNING id, size_bytes
+      `,
+      [ownerUserId, col, cat, name],
+    );
+
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+    return res.json({ ok: true, sizeBytes: Number(r.rows[0]?.size_bytes ?? 0) });
+  } catch (e) {
+    console.error('[record-delete]', e);
     return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
 });
@@ -175,108 +622,93 @@ app.post('/files/upload', async (req, res) => {
 // POST /auth/signup { name, email, password, phone, plannerNo? }
 app.post('/auth/signup', async (req, res) => {
   try {
-    const { name, email, password, phone, plannerNo } = req.body ?? {}; // ★★★ 추가: plannerNo 수신
+    const { name, email, password, phone, plannerNo } = req.body ?? {};
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
-    if (!isEmail(email)) {
-      return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
-    }
-    if (!passwordStrong(password)) {
-      return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
-    }
+    if (!name || !email || !password) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+    if (!isEmail(email)) return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
+    if (!passwordStrong(password)) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
 
-    // 전화번호 숫자만 + 10~11자리
     const phoneDigits = onlyDigits(phone || '');
-    if (!isPhone10or11(phoneDigits)) {
-      return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
-    }
+    if (!isPhone10or11(phoneDigits)) return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
 
-    // ★★★ 추가: plannerNo 유효성(선택 입력)
-    let plannerRow = null; // { id, role } | null
+    let plannerRow = null;
     let plannerNoInt = null;
     if (plannerNo !== undefined && plannerNo !== null && String(plannerNo).trim() !== '') {
       const pn = onlyDigits(String(plannerNo));
-      if (!pn) {
-        return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
-      }
+      if (!pn) return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
       plannerNoInt = Number(pn);
 
-      // user_no로 설계사 존재/역할 확인
-      const rPlanner = await query(
-        `SELECT id, role FROM users WHERE user_no = $1 LIMIT 1`,
-        [plannerNoInt]
-      );
-      if (!rPlanner.rowCount) {
-        return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
-      }
+      const rPlanner = await query(`SELECT id, role FROM users WHERE user_no = $1 LIMIT 1`, [plannerNoInt]);
+      if (!rPlanner.rowCount) return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
       plannerRow = rPlanner.rows[0];
-      if (plannerRow.role !== 'planner') {
-        return res.status(400).json({ ok: false, error: 'PLANNER_NO_NOT_PLANNER' });
-      }
+      if (plannerRow.role !== 'planner') return res.status(400).json({ ok: false, error: 'PLANNER_NO_NOT_PLANNER' });
     }
 
     const emailNorm = String(email).trim();
+    const existed = await query('SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1', [emailNorm]);
+    if (existed.rowCount) return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
 
-    // 이메일 중복
-    const existed = await query(
-      'SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1',
-      [emailNorm]
-    );
-    if (existed.rowCount) {
-      return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
-    }
-
-    // 저장 (phone 포함) + ★★★ 추가: planner_no 선택적 반영
     const hash = await bcrypt.hash(String(password), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
-    let ins;
-    if (plannerRow) {
-      // ★★★ 변경: planner_no 포함 INSERT + user_no도 RETURNING
-      ins = await query(
-        `INSERT INTO users (email, password_hash, name, role, phone, planner_no)
-         VALUES ($1,$2,$3,'user',$4,$5)
-         RETURNING id, email, name, role, phone, user_no, planner_no, created_at`,
-        [emailNorm, hash, String(name).trim(), phoneDigits, plannerNoInt]
-      );
-    } else {
-      // 기존 경로 유지 + ★★★ user_no도 RETURNING
-      ins = await query(
-        `INSERT INTO users (email, password_hash, name, role, phone)
-         VALUES ($1,$2,$3,'user',$4)
-         RETURNING id, email, name, role, phone, user_no, created_at`,
-        [emailNorm, hash, String(name).trim(), phoneDigits]
-      );
-    }
-    const user = ins.rows[0];
 
-    // ★★★ 추가: 설계사 번호가 유효했다면 기본 배정 레코드 생성 (중복시 무시)
-    if (plannerRow) {
-      try {
-        await query(
-          `INSERT INTO planner_assignments (user_id, planner_id, is_primary)
-           VALUES ($1,$2,true)
-           ON CONFLICT (user_id, planner_id) DO NOTHING`,
-          [user.id, plannerRow.id]
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let ins;
+      if (plannerRow) {
+        await enforcePlannerCustomerLimitTx(client, plannerNoInt);
+
+        ins = await client.query(
+          `INSERT INTO users (email, password_hash, name, role, phone, planner_no, used_bytes, file_bytes)
+           VALUES ($1,$2,$3,'user',$4,$5,0,$6)
+           RETURNING id, email, name, role, phone, user_no, planner_no, file_bytes, used_bytes, created_at`,
+          [emailNorm, hash, String(name).trim(), phoneDigits, plannerNoInt, DEFAULT_USER_FILE_MB],
         );
-      } catch (e) {
-        // 배정 실패는 가입 자체를 막지 않음(로그만 남김)
-        console.warn('[signup] planner_assignments insert failed', e?.code || e?.message || e);
+      } else {
+        ins = await client.query(
+          `INSERT INTO users (email, password_hash, name, role, phone, used_bytes, file_bytes)
+           VALUES ($1,$2,$3,'user',$4,0,$5)
+           RETURNING id, email, name, role, phone, user_no, file_bytes, used_bytes, created_at`,
+          [emailNorm, hash, String(name).trim(), phoneDigits, DEFAULT_USER_FILE_MB],
+        );
       }
+
+      const user = ins.rows[0];
+
+      if (plannerRow) {
+        try {
+          await client.query(
+            `INSERT INTO planner_assignments (user_id, planner_id, is_primary)
+             VALUES ($1,$2,true)
+             ON CONFLICT (user_id, planner_id) DO NOTHING`,
+            [user.id, plannerRow.id],
+          );
+        } catch (e) {
+          console.warn('[signup] planner_assignments insert failed', e?.code || e?.message || e);
+        }
+      }
+
+      await client.query('COMMIT');
+
+      const token = jwt.sign({ sub: user.id, role: user.role, user_no: user.user_no }, process.env.JWT_SECRET, {
+        expiresIn: '7d',
+      });
+
+      return res.status(201).json({ ok: true, token, user });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (e?.code === 'CUSTOMER_LIMIT_EXCEEDED') {
+        return res.status(403).json({ ok: false, error: 'CUSTOMER_LIMIT_EXCEEDED', detail: e?.detail || null });
+      }
+      if (e?.code === 'INVALID_PLANNER_NO') return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
+      throw e;
+    } finally {
+      client.release();
     }
-
-    // ★★★ 토큰 sub: 이제 user_no 를 확실히 사용할 수 있음
-    const token = jwt.sign(
-      { sub: user.user_no, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(201).json({ ok: true, token, user });
   } catch (e) {
     if (e?.code === '23505') return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
     console.error('[signup]', e);
-    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
 });
 
@@ -284,9 +716,7 @@ app.post('/auth/signup', async (req, res) => {
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body ?? {};
-    if (!email || !password) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
+    if (!email || !password) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
 
     const r = await query(
       `SELECT 
@@ -296,39 +726,31 @@ app.post('/auth/login', async (req, res) => {
          role,
          is_active,
          password_hash,
-         user_no,      
-         planner_no    
+         user_no,
+         planner_no,
+         file_bytes,
+         used_bytes,
+         intro_text,
+         created_at,
+         updated_at
        FROM users
        WHERE lower(email)=lower($1)
        LIMIT 1`,
-      [String(email).trim()]
+      [String(email).trim()],
     );
 
-    if (!r.rowCount) {
-      return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
-    }
+    if (!r.rowCount) return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
 
     const user = r.rows[0];
+    const ok = user.password_hash ? await bcrypt.compare(String(password), user.password_hash) : false;
+    if (!ok) return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
+    if (user.is_active === false) return res.status(403).json({ ok: false, error: 'INACTIVE_USER' });
 
-    const ok = user.password_hash
-      ? await bcrypt.compare(String(password), user.password_hash)
-      : false;
-    if (!ok) {
-      return res.status(401).json({ ok: false, error: 'INVALID_CREDENTIALS' });
-    }
-    if (user.is_active === false) {
-      return res.status(403).json({ ok: false, error: 'INACTIVE_USER' });
-    }
-
-    const token = jwt.sign(
-      { sub: user.id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    const token = jwt.sign({ sub: user.id, role: user.role, user_no: user.user_no }, process.env.JWT_SECRET, {
+      expiresIn: '7d',
+    });
 
     delete user.password_hash;
-
-    // ★★★ 여기서 user 객체에는 user_no, planner_no 가 그대로 포함됨
     return res.json({ ok: true, token, user });
   } catch (e) {
     console.error('[login]', e);
@@ -336,21 +758,17 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-
 // GET /auth/check-email?email=...
 app.get('/auth/check-email', async (req, res) => {
   try {
     const email = String(req.query.email || '').trim();
-    if (!email || !isEmail(email)) {
-      // invalid 형식도 ok:true로 응답하되 사용불가 처리
-      return res.json({ ok: true, available: false });
-    }
+    if (!email || !isEmail(email)) return res.json({ ok: true, available: false });
+
     const r = await query('SELECT 1 FROM users WHERE lower(email)=lower($1) LIMIT 1', [email]);
-    const available = r.rowCount === 0;
-    res.json({ ok: true, available });
+    return res.json({ ok: true, available: r.rowCount === 0 });
   } catch (e) {
     console.error('[check-email]', e);
-    res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
 });
 
@@ -362,9 +780,7 @@ app.post('/auth/find-id', async (req, res) => {
 
     const nameOk = /^[가-힣a-zA-Z\s]{2,}$/.test(nmRaw);
     const phoneOk = /^[0-9]{10,11}$/.test(ph);
-    if (!nameOk || !phoneOk) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
+    if (!nameOk || !phoneOk) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
 
     const q = `
       SELECT email
@@ -374,10 +790,8 @@ app.post('/auth/find-id', async (req, res) => {
       LIMIT 1
     `;
     const r = await query(q, [nmRaw, ph]);
-
     if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
 
-    // ✅ 마스킹 없이 전체 이메일 반환
     return res.json({ ok: true, email: r.rows[0].email });
   } catch (e) {
     console.error('[find-id]', e);
@@ -393,9 +807,7 @@ app.post('/auth/verify-owner', async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const phone = onlyDigits(String(req.body?.phone || ''));
-    if (!isEmail(email) || !/^[0-9]{10,11}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
+    if (!isEmail(email) || !/^[0-9]{10,11}$/.test(phone)) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
 
     const q = `
       SELECT id
@@ -408,13 +820,7 @@ app.post('/auth/verify-owner', async (req, res) => {
     if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
 
     const userId = r.rows[0].id;
-
-    const ticket = jwt.sign(
-      { typ: 'pwd_reset', sub: userId, eml: email },
-      process.env.JWT_SECRET,
-      { expiresIn: '10m' }
-    );
-
+    const ticket = jwt.sign({ typ: 'pwd_reset', sub: userId, eml: email }, process.env.JWT_SECRET, { expiresIn: '10m' });
     return res.json({ ok: true, ticket });
   } catch (e) {
     console.error('[verify-owner]', e);
@@ -426,12 +832,8 @@ app.post('/auth/verify-owner', async (req, res) => {
 app.post('/auth/reset', async (req, res) => {
   try {
     const { ticket, newPassword } = req.body ?? {};
-    if (!ticket || !newPassword) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
-    if (!passwordStrong(String(newPassword))) {
-      return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
-    }
+    if (!ticket || !newPassword) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+    if (!passwordStrong(String(newPassword))) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
 
     let payload;
     try {
@@ -439,13 +841,8 @@ app.post('/auth/reset', async (req, res) => {
     } catch {
       return res.status(400).json({ ok: false, error: 'BAD_TICKET' });
     }
-    if (payload?.typ !== 'pwd_reset' || !payload?.sub) {
-      return res.status(400).json({ ok: false, error: 'BAD_TICKET' });
-    }
-
-    if (usedTickets.has(ticket)) {
-      return res.status(400).json({ ok: false, error: 'BAD_TICKET' });
-    }
+    if (payload?.typ !== 'pwd_reset' || !payload?.sub) return res.status(400).json({ ok: false, error: 'BAD_TICKET' });
+    if (usedTickets.has(ticket)) return res.status(400).json({ ok: false, error: 'BAD_TICKET' });
 
     const hash = await bcrypt.hash(String(newPassword), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
     await query(`UPDATE users SET password_hash=$1 WHERE id=$2`, [hash, payload.sub]);
@@ -458,13 +855,13 @@ app.post('/auth/reset', async (req, res) => {
   }
 });
 
-// ★★★ GET /me - 토큰 기준 현재 로그인한 유저 정보 반환
-app.get('/me', async (req, res) => {
+// ★★★ GET /auth/me - 토큰 기준 현재 로그인한 유저 정보 반환
+app.get('/auth/me', async (req, res) => {
+  console.log('[/auth/me] hit', new Date().toISOString(), 'pid=', process.pid);
+  console.log('[/auth/me] host=', req.headers.host, 'origin=', req.headers.origin);
   try {
     const payload = verifyTokenFromReq(req);
-    if (!payload?.sub) {
-      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
-    }
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 
     const r = await query(
       `
@@ -474,9 +871,14 @@ app.get('/me', async (req, res) => {
         u.name,
         u.role,
         u.phone,
+        u.is_active,
         u.user_no,
         u.planner_no,
+        u.file_bytes,
+        u.used_bytes,
+        u.intro_text,
         u.created_at,
+        u.updated_at,
         p.name AS planner_name
       FROM users AS u
       LEFT JOIN users AS p
@@ -485,12 +887,10 @@ app.get('/me', async (req, res) => {
       WHERE u.id = $1
       LIMIT 1
       `,
-      [payload.sub]
+      [payload.sub],
     );
 
-    if (!r.rowCount) {
-      return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
-    }
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
 
     const user = r.rows[0];
     return res.json({ ok: true, user });
@@ -500,13 +900,11 @@ app.get('/me', async (req, res) => {
   }
 });
 
-// ★★★ PUT /me - 현재 로그인한 유저 정보 수정(이메일/전화/비밀번호/소개문구)
-app.put('/me', async (req, res) => {
+// ★★★ PUT /auth/me
+app.put('/auth/me', async (req, res) => {
   try {
     const payload = verifyTokenFromReq(req);
-    if (!payload?.sub) {
-      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
-    }
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 
     const { email, phone, intro_text, password } = req.body ?? {};
 
@@ -514,52 +912,34 @@ app.put('/me', async (req, res) => {
     const params = [];
     let idx = 1;
 
-    // 이메일 변경
     if (email !== undefined) {
-      if (!isEmail(email)) {
-        return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
-      }
+      if (!isEmail(email)) return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
       updates.push(`email = $${idx++}`);
       params.push(String(email).trim());
     }
 
-    // 전화번호 변경
     if (phone !== undefined) {
       const phoneDigits = onlyDigits(String(phone));
-      if (!isPhone10or11(phoneDigits)) {
-        return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
-      }
+      if (!isPhone10or11(phoneDigits)) return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
       updates.push(`phone = $${idx++}`);
       params.push(phoneDigits);
     }
 
-    // 소개 문구 변경 (users 테이블에 intro_text 컬럼이 있어야 함!)
     if (intro_text !== undefined) {
       updates.push(`intro_text = $${idx++}`);
       params.push(String(intro_text));
     }
 
-    // 비밀번호 변경
     if (password !== undefined && String(password).trim() !== '') {
-      if (!passwordStrong(password)) {
-        return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
-      }
-
-      const hash = await bcrypt.hash(
-        String(password),
-        Number(process.env.BCRYPT_SALT_ROUNDS || 10)
-      );
+      if (!passwordStrong(password)) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
+      const hash = await bcrypt.hash(String(password), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
       updates.push(`password_hash = $${idx++}`);
       params.push(hash);
     }
 
-    if (updates.length === 0) {
-      // 변경할 게 없으면 그냥 OK
-      return res.json({ ok: true });
-    }
+    if (updates.length === 0) return res.json({ ok: true });
 
-    // 실제 업데이트
-    params.push(payload.sub); // where id = $idx
+    params.push(payload.sub);
     const q = `
       UPDATE users
          SET ${updates.join(', ')},
@@ -569,12 +949,9 @@ app.put('/me', async (req, res) => {
     `;
 
     const r = await query(q, params);
-    if (!r.rowCount) {
-      return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
-    }
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
 
-    const user = r.rows[0];
-    return res.json({ ok: true, user });
+    return res.json({ ok: true, user: r.rows[0] });
   } catch (e) {
     console.error('[me:PUT]', e);
     return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
@@ -582,28 +959,25 @@ app.put('/me', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// WebSocket (Signaling) — 강화판
+// WebSocket (Signaling)
 // ─────────────────────────────────────────────────────────
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const ws = new WebSocketServer({ server, path: '/signal' });
 
-// 방 관리: roomId -> Set<ws>
 const rooms = new Map();
-
-// 소켓 메타(생존/방목록/마지막 pong 등) 추적
 const wsMeta = new WeakMap();
 
-// 환경설정
 const MAX_ROOM_SIZE = Number(process.env.MAX_ROOM_SIZE || 2);
 const HEARTBEAT_INTERVAL_MS = Number(process.env.HEARTBEAT_INTERVAL_MS || 30_000);
 const CLIENT_TIMEOUT_MS = Number(process.env.CLIENT_TIMEOUT_MS || 90_000);
 
-// 유틸: 안전 전송
-function safeSend(ws, obj) {
-  try { ws.send(JSON.stringify(obj)); } catch {}
+function safeSend(sock, obj) {
+  try {
+    sock.send(JSON.stringify(obj));
+  } catch {}
 }
 
-function notifyPeers(roomId, payload, except=null) {
+function notifyPeers(roomId, payload, except = null) {
   const set = rooms.get(roomId);
   if (!set) return;
   for (const peer of set) {
@@ -611,154 +985,115 @@ function notifyPeers(roomId, payload, except=null) {
   }
 }
 
-function join(ws, roomId) {
-  if (!roomId) return safeSend(ws, { type: 'error', error: 'roomId_required' });
+function join(sock, roomId) {
+  if (!roomId) return safeSend(sock, { type: 'error', error: 'roomId_required' });
 
   if (!rooms.has(roomId)) rooms.set(roomId, new Set());
   const set = rooms.get(roomId);
-  if (set.size >= 2) return safeSend(ws, { type: 'room-full', roomId });
+  if (set.size >= MAX_ROOM_SIZE) return safeSend(sock, { type: 'room-full', roomId });
 
-  set.add(ws);
-  ws._rooms ??= new Set();
-  ws._rooms.add(roomId);
+  set.add(sock);
+  sock._rooms ??= new Set();
+  sock._rooms.add(roomId);
 
-  // 나에게 현재 인원 알려주기
-  safeSend(ws, { type: 'joined', roomId, peers: set.size });
-
-  // ✅ 기존 참가자에게 "새 피어 들어옴" 알림
-  notifyPeers(roomId, { type: 'peer-join', roomId, peers: set.size }, ws);
+  safeSend(sock, { type: 'joined', roomId, peers: set.size });
+  notifyPeers(roomId, { type: 'peer-join', roomId, peers: set.size }, sock);
 
   console.log(`[WS] joined room=${roomId} peers=${set.size}`);
 }
 
-function leaveAll(ws) {
-  for (const roomId of ws._rooms || []) {
+function leaveAll(sock) {
+  for (const roomId of sock._rooms || []) {
     const set = rooms.get(roomId);
     if (!set) continue;
-    set.delete(ws);
+    set.delete(sock);
     if (set.size === 0) {
       rooms.delete(roomId);
       console.log(`room empty -> deleted room=${roomId}`);
     } else {
-      // ✅ 남아있는 참가자에게 "피어 떠남" 알림
       notifyPeers(roomId, { type: 'peer-left', roomId, peers: set.size });
       console.log(`[WS] left room=${roomId} peers=${set.size}`);
     }
   }
 }
 
-// 유틸: 같은 방 피어에게 릴레이
-function relay(ws, roomId, payload) {
+function relay(sock, roomId, payload) {
   const set = rooms.get(roomId);
   if (!set) return;
   for (const peer of set) {
-    if (peer !== ws && peer.readyState === 1) {
-      safeSend(peer, payload);
-    }
+    if (peer !== sock && peer.readyState === 1) safeSend(peer, payload);
   }
 }
 
-// 메시지 스키마 간단 검증
 function isSignalWithRoom(msg) {
   return msg && typeof msg === 'object' && typeof msg.roomId === 'string';
 }
 
-// 하트비트: 서버→클라 ping, 클라 pong 확인
 const heartbeatTimer = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    const meta = wsMeta.get(ws);
+  ws.clients.forEach((sock) => {
+    const meta = wsMeta.get(sock);
     if (!meta) return;
     const now = Date.now();
 
-    // 클라가 ping을 보내는 경우도 있지만, 서버 주도로 ping을 보냄
-    if (ws.readyState === 1) {
-      try { ws.ping(); } catch {}
+    if (sock.readyState === 1) {
+      try {
+        sock.ping();
+      } catch {}
     }
 
-    // 마지막 pong으로부터 너무 오래되면 종료
     if (now - meta.lastPongAt > CLIENT_TIMEOUT_MS) {
       console.warn('[WS] terminate stale client');
-      try { ws.terminate(); } catch {}
+      try {
+        sock.terminate();
+      } catch {}
     }
   });
 }, HEARTBEAT_INTERVAL_MS);
 
-wss.on('connection', (ws, req) => {
-  console.log(`[WS] connection from ${req.socket.remoteAddress}`);
+ws.on('connection', (sock, req) => {
+  wsMeta.set(sock, { rooms: new Set(), lastPongAt: Date.now() });
 
-  wsMeta.set(ws, {
-    rooms: new Set(),
-    lastPongAt: Date.now(),
-  });
-
-  const ip =
-    req.headers['x-forwarded-for']?.toString().split(',')[0].trim() ||
-    req.socket.remoteAddress;
+  const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress;
   console.log('[WS] connection from', ip);
 
-  // 기본 이벤트
-  ws.on('pong', () => {
-    const meta = wsMeta.get(ws);
+  sock.on('pong', () => {
+    const meta = wsMeta.get(sock);
     if (meta) meta.lastPongAt = Date.now();
   });
 
-  ws.on('message', (raw) => {
+  sock.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch {
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
       console.warn('[WS] non-JSON message ignored');
       return;
     }
-    console.log('[WS] recv type=%s room=%s', msg?.type, msg?.roomId)
 
-    // 디버그: 모든 타입 로깅
-    const room = msg?.roomId ?? '-';
-    console.log(`[WS] recv type=${msg?.type} room=${room}`);
-
-    // 클라 ping 대응
     if (msg?.type === 'ping') {
-      safeSend(ws, { type: 'pong', t: Date.now() });
+      safeSend(sock, { type: 'pong', t: Date.now() });
       return;
     }
 
-    if (msg?.type === 'join') {
-      console.log(`[WS] join requested room=${msg.roomId}`);
-      return join(ws, msg.roomId);
-    }
+    if (msg?.type === 'join') return join(sock, msg.roomId);
 
     if (['offer', 'answer', 'ice'].includes(msg?.type)) {
-      if (!isSignalWithRoom(msg)) {
-        console.warn(`[WS] invalid signal without roomId type=${msg?.type}`);
-        return safeSend(ws, { type: 'error', error: 'roomId_required' });
-      }
-      // 필수 필드 체크 로그
-      if (msg.type === 'offer' && !msg.sdp) console.warn('[WS] offer without sdp');
-      if (msg.type === 'answer' && !msg.sdp) console.warn('[WS] answer without sdp');
-      if (msg.type === 'ice' && !msg.candidate) console.warn('[WS] ice without candidate');
-
-      console.log(`[WS] relay type=${msg.type} room=${msg.roomId}`);
-      relay(ws, msg.roomId, msg);
+      if (!isSignalWithRoom(msg)) return safeSend(sock, { type: 'error', error: 'roomId_required' });
+      relay(sock, msg.roomId, msg);
       return;
     }
 
-    safeSend(ws, { type: 'error', error: 'unknown_type', raw: msg?.type });
+    safeSend(sock, { type: 'error', error: 'unknown_type', raw: msg?.type });
   });
 
-  ws.on('close', () => {
-    leaveAll(ws);
-  });
-
-  ws.on('error', (err) => {
-    console.warn('[WS] error', err?.message || err);
-  });
+  sock.on('close', () => leaveAll(sock));
+  sock.on('error', (err) => console.warn('[WS] error', err?.message || err));
 });
 
 // 디버그: 현재 방/피어 상태 조회
-app.get('/debug/rooms', (_req, res) => {
+app.get('/auth/rooms', (_req, res) => {
   const out = [];
-  for (const [roomId, set] of rooms.entries()) {
-    out.push({ roomId, peers: set.size });
-  }
+  for (const [roomId, set] of rooms.entries()) out.push({ roomId, peers: set.size });
   res.json({ ok: true, rooms: out });
 });
 
@@ -772,57 +1107,34 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-server.listen(PORT, () => {
-  console.log(`HTTP+WS signaling up: http://0.0.0.0:${PORT}`);
-});
-
-// ------------------------
-
 // ★★★ [추가] 설계사 회원가입: POST /auth/signup-planner
 app.post('/auth/signup-planner', async (req, res) => {
   try {
     const { name, email, password, phone } = req.body ?? {};
 
-    // 기본 검증 (일반 가입과 동일 정책)
-    if (!name || !email || !password) {
-      return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
-    }
-    if (!isEmail(email)) {
-      return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
-    }
-    if (!passwordStrong(password)) {
-      return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
-    }
+    if (!name || !email || !password) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+    if (!isEmail(email)) return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
+    if (!passwordStrong(password)) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
 
     const phoneDigits = onlyDigits(phone || '');
-    if (!isPhone10or11(phoneDigits)) {
-      return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
-    }
+    if (!isPhone10or11(phoneDigits)) return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
 
-    // 이메일 중복
-    const existed = await query(
-      'SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1',
-      [String(email).trim()]
-    );
-    if (existed.rowCount) {
-      return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
-    }
+    const existed = await query('SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1', [String(email).trim()]);
+    if (existed.rowCount) return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
 
-    // ★★★ 핵심: role='planner'로 저장 (planner_no는 NULL이어야 함)
-    // DB 트리거가 자동으로 planner 시퀀스(user_no_planner_seq)에서 user_no를 부여
     const hash = await bcrypt.hash(String(password), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
     const ins = await query(
       `INSERT INTO users (email, password_hash, name, role, phone)
        VALUES ($1,$2,$3,'planner',$4)
        RETURNING id, email, name, role, phone, user_no, created_at`,
-      [String(email).trim(), hash, String(name).trim(), phoneDigits]
+      [String(email).trim(), hash, String(name).trim(), phoneDigits],
     );
     const user = ins.rows[0];
 
-    // 토큰 발급(관리 콘솔에서 바로 로그인하게 하려면 유지)
-    const token = jwt.sign({ sub: user.user_no, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    const token = jwt.sign({ sub: user.id, role: user.role, user_no: user.user_no }, process.env.JWT_SECRET, {
+      expiresIn: '7d',
+    });
 
-    // ★★★ user_no가 설계사 번호
     return res.status(201).json({ ok: true, token, user });
   } catch (e) {
     if (e?.code === '23505') return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
@@ -832,43 +1144,21 @@ app.post('/auth/signup-planner', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// (signaling.js 상단 import 아래, helpers 근처에 없으면 추가)
-// ─────────────────────────────────────────────────────────
-
-// ★★★ JWT 토큰 파싱 유틸 (없으면 추가)
-function verifyTokenFromReq(req) {
-  try {
-    const h = req.headers.authorization || req.headers.Authorization || '';
-    const [typ, tk] = String(h).split(' ');
-    if (typ?.toLowerCase() !== 'bearer' || !tk) return null;
-    return jwt.verify(tk, process.env.JWT_SECRET);
-  } catch {
-    return null;
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// (Auth API들 바로 아래쯤에 추가) 내 고객 목록
+// 내 고객 목록 / quota 변경 / by-user-no / customers CRUD / usedbytes/add
+// (아래는 사용자가 준 코드 그대로 유지)
 // ─────────────────────────────────────────────────────────
 
 // ★★★ GET /customers/mine
-// - planner: 본인에게 배정된 고객(users.role='user') 목록만 반환
-// - admin  : 전체 고객 목록 반환 (원하면 ?plannerId=...로 특정 설계사 필터 가능)
 app.get('/customers/mine', async (req, res) => {
   try {
     const payload = verifyTokenFromReq(req);
     if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 
-    // 나(접속자) 정보 조회: role, user_no 필요
-    const meRes = await query(
-      `SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`,
-      [payload.sub]
-    );
+    const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
     if (!meRes.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
 
     const me = meRes.rows[0];
 
-    // 플래너: 내 user_no를 고객의 planner_no와 매칭
     if (me.role === 'planner') {
       const q = `
         SELECT 
@@ -878,29 +1168,30 @@ app.get('/customers/mine', async (req, res) => {
           email,
           phone,
           created_at,
-          file_bytes,   -- ★ 추가
-          used_bytes    -- ★ 추가
+          file_bytes,
+          used_bytes,
+          is_active
         FROM users
         WHERE role = 'user'
           AND planner_no = $1
         ORDER BY created_at DESC
       `;
       const r = await query(q, [me.user_no]);
-      const customers = r.rows.map(u => ({
+      const customers = r.rows.map((u) => ({
         id: u.id,
         name: u.name,
         email: u.email,
         phone: u.phone,
         user_no: u.user_no,
         created_at: u.created_at,
-        file_bytes: u.file_bytes,   // ★ 추가
-        used_bytes: u.used_bytes,   // ★ 추가
+        file_bytes: u.file_bytes,
+        used_bytes: u.used_bytes,
+        is_active: u.is_active,
       }));
       return res.json({ ok: true, customers });
     }
 
-    // 관리자: 전체 고객 or 특정 플래너의 고객(쿼리로 필터)
-    if (me.role === 'admin') {
+    if (me.role === 'admin' || me.role === 'manager') {
       const plannerUserNo = req.query.plannerUserNo ? Number(req.query.plannerUserNo) : null;
 
       if (plannerUserNo) {
@@ -912,23 +1203,25 @@ app.get('/customers/mine', async (req, res) => {
             email,
             phone,
             created_at,
-            file_bytes,   -- ★ 추가
-            used_bytes    -- ★ 추가
+            file_bytes,
+            used_bytes,
+            is_active
           FROM users
           WHERE role = 'user'
             AND planner_no = $1
           ORDER BY created_at DESC
         `;
         const r = await query(q, [plannerUserNo]);
-        const customers = r.rows.map(u => ({
+        const customers = r.rows.map((u) => ({
           id: u.id,
           name: u.name,
           email: u.email,
           phone: u.phone,
           user_no: u.user_no,
           created_at: u.created_at,
-          file_bytes: u.file_bytes,   // ★ 추가
-          used_bytes: u.used_bytes,   // ★ 추가
+          file_bytes: u.file_bytes,
+          used_bytes: u.used_bytes,
+          is_active: u.is_active,
         }));
         return res.json({ ok: true, customers });
       } else {
@@ -940,28 +1233,29 @@ app.get('/customers/mine', async (req, res) => {
             email,
             phone,
             created_at,
-            file_bytes,   -- ★ 추가
-            used_bytes    -- ★ 추가
+            file_bytes,
+            used_bytes,
+            is_active
           FROM users
           WHERE role = 'user'
           ORDER BY created_at DESC
         `;
         const r = await query(q);
-        const customers = r.rows.map(u => ({
+        const customers = r.rows.map((u) => ({
           id: u.id,
           name: u.name,
           email: u.email,
           phone: u.phone,
           user_no: u.user_no,
           created_at: u.created_at,
-          file_bytes: u.file_bytes,   // ★ 추가
-          used_bytes: u.used_bytes,   // ★ 추가
+          file_bytes: u.file_bytes,
+          used_bytes: u.used_bytes,
+          is_active: u.is_active,
         }));
         return res.json({ ok: true, customers });
       }
     }
 
-    // 일반 사용자는 접근 불가
     return res.status(403).json({ ok: false, error: 'FORBIDDEN' });
   } catch (e) {
     console.error('[customers/mine]', e);
@@ -969,53 +1263,33 @@ app.get('/customers/mine', async (req, res) => {
   }
 });
 
-// ★★★ 설계사가 담당 고객의 저장 용량(GB)을 변경
+// ★★★ 설계사가 담당 고객의 저장 용량(MB)을 변경
 app.put('/customers/filequota', async (req, res) => {
   try {
     const payload = verifyTokenFromReq(req);
-    if (!payload?.sub) {
-      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
-    }
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
 
-    // ✅ 프론트에서 오는 이름에 맞춰준다.
     const { customerUserNo, fileBytes } = req.body ?? {};
-    // fileBytes: 10, 30, 50 (GB 단위)
-
-    // 문자열로 와도 숫자로 변환
     const userNo = Number(customerUserNo);
     const fileBytesNum = Number(fileBytes);
 
-    // ✅ 숫자 여부 검사
     if (!Number.isFinite(userNo) || !Number.isFinite(fileBytesNum)) {
       return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
     }
-
     if (![10, 30, 50].includes(fileBytesNum)) {
       return res.status(400).json({ ok: false, error: 'INVALID_QUOTA' });
     }
 
-    // 나(설계사) 정보 가져오기
-    const meRes = await query(
-      `SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`,
-      [payload.sub]
-    );
-    if (!meRes.rowCount) {
-      return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
-    }
+    const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
+    if (!meRes.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
     const me = meRes.rows[0];
 
-    // manager/admin/planner 만 변경 허용
-    if (
-      me.role !== 'planner' &&
-      me.role !== 'admin' &&
-      me.role !== 'manager'
-    ) {
+    if (me.role !== 'planner' && me.role !== 'admin' && me.role !== 'manager') {
       return res.status(403).json({ ok: false, error: 'FORBIDDEN_ROLE' });
     }
 
     let r;
     if (me.role === 'planner') {
-      // 설계사는 "내 고객"만 변경 가능
       r = await query(
         `
         UPDATE users
@@ -1025,10 +1299,9 @@ app.put('/customers/filequota', async (req, res) => {
           AND planner_no = $3
         RETURNING id, user_no, file_bytes, used_bytes
         `,
-        [userNo, fileBytesNum, me.user_no]
+        [userNo, fileBytesNum, me.user_no],
       );
     } else {
-      // admin / manager 는 전체 고객 변경 가능
       r = await query(
         `
         UPDATE users
@@ -1037,28 +1310,18 @@ app.put('/customers/filequota', async (req, res) => {
           AND role = 'user'
         RETURNING id, user_no, file_bytes, used_bytes
         `,
-        [userNo, fileBytesNum]
+        [userNo, fileBytesNum],
       );
     }
 
     if (!r.rowCount) {
-      return res.status(404).json({
-        ok: false,
-        error: 'USER_NOT_FOUND_OR_NO_PERMISSION',
-      });
+      return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND_OR_NO_PERMISSION' });
     }
 
     const updated = r.rows[0];
-
-    // ✅ 프론트에서 j.customer 로 읽도록 맞춰서 보낸다.
     return res.json({
       ok: true,
-      customer: {
-        id: updated.id,
-        user_no: updated.user_no,
-        file_bytes: updated.file_bytes,
-        used_bytes: updated.used_bytes,
-      },
+      customer: { id: updated.id, user_no: updated.user_no, file_bytes: updated.file_bytes, used_bytes: updated.used_bytes },
     });
   } catch (e) {
     console.error('[customers/filequota]', e);
@@ -1066,27 +1329,21 @@ app.put('/customers/filequota', async (req, res) => {
   }
 });
 
-// ★★★ GET /planners/by-user-no
-// - 쿼리: ?userNo=1002 (또는 ?plannerNo=2002 로 직접 설계사 번호 넘겨도 됨)
-// - 리턴: { ok: true, planner: { id, user_no, name, email, phone, ... } }
-app.get('/planners/by-user-no', async (req, res) => {
+// ★★★ GET /auth/by-user-no (full columns)
+app.get('/auth/by-user-no', async (req, res) => {
   try {
     const userNoRaw = req.query.userNo;
     const plannerNoRaw = req.query.plannerNo;
 
-    // 숫자만 추출
     const userNo = userNoRaw ? onlyDigits(String(userNoRaw)) : '';
     const plannerNo = plannerNoRaw ? onlyDigits(String(plannerNoRaw)) : '';
 
     if (!userNo && !plannerNo) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'userNo or plannerNo required' });
+      return res.status(400).json({ ok: false, error: 'userNo or plannerNo required' });
     }
 
     let plannerNoFinal = plannerNo || null;
 
-    // ★★★ 1) userNo만 넘어오면: 그 사용자의 planner_no를 먼저 찾는다
     if (!plannerNoFinal && userNo) {
       const rUser = await query(
         `
@@ -1096,70 +1353,397 @@ app.get('/planners/by-user-no', async (req, res) => {
           AND role = 'user'
         LIMIT 1
         `,
-        [Number(userNo)]
+        [Number(userNo)],
       );
 
       if (!rUser.rowCount || !rUser.rows[0].planner_no) {
-        return res.status(404).json({
-          ok: false,
-          error: 'PLANNER_NOT_ASSIGNED',
-        });
+        return res.status(404).json({ ok: false, error: 'PLANNER_NOT_ASSIGNED' });
       }
 
       plannerNoFinal = String(rUser.rows[0].planner_no);
     }
 
-    if (!plannerNoFinal) {
-      return res
-        .status(404)
-        .json({ ok: false, error: 'PLANNER_NOT_FOUND' });
-    }
+    if (!plannerNoFinal) return res.status(404).json({ ok: false, error: 'PLANNER_NOT_FOUND' });
 
-    // ★★★ 2) planner_no 기준으로 설계사(users.role='planner') 조회
     const rPlanner = await query(
       `
       SELECT
         id,
-        user_no,
-        name,
         email,
+        password_hash,
+        name,
         phone,
         role,
-        created_at
+        is_active,
+        user_no,
+        planner_no,
+        file_bytes,
+        used_bytes,
+        intro_text,
+        created_at,
+        updated_at
       FROM users
       WHERE user_no = $1
         AND role = 'planner'
       LIMIT 1
       `,
-      [Number(plannerNoFinal)]
+      [Number(plannerNoFinal)],
     );
 
-    if (!rPlanner.rowCount) {
-      return res
-        .status(404)
-        .json({ ok: false, error: 'PLANNER_NOT_FOUND' });
-    }
+    if (!rPlanner.rowCount) return res.status(404).json({ ok: false, error: 'PLANNER_NOT_FOUND' });
 
     const p = rPlanner.rows[0];
-
-    // ★★★ 응답 스키마 — 프론트에서 그대로 planner.* 로 사용
-    const planner = {
-      id: p.id,
-      user_no: p.user_no,
-      name: p.name,
-      email: p.email,
-      phone: p.phone,
-      role: p.role,
-      created_at: p.created_at,
-      // ★★★ 여기에 branch 같은 컬럼 있으면 추가
-      // branch: p.branch_name ?? null,
-    };
-
-    return res.json({ ok: true, planner });
+    delete p.password_hash;
+    return res.json({ ok: true, planner: p });
   } catch (e) {
-    console.error('[planners/by-user-no]', e);
-    return res
-      .status(500)
-      .json({ ok: false, error: 'SERVER_ERROR' });
+    console.error('[/auth/by-user-no]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
   }
+});
+
+// 권한 유틸: admin/manager/planner 허용 + planner는 내 고객만 처리하도록 me 정보 리턴
+async function requireStaff(req, res) {
+  const payload = verifyTokenFromReq(req);
+  if (!payload?.sub) {
+    res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+    return null;
+  }
+
+  const meRes = await query(`SELECT id, role, user_no FROM users WHERE id=$1 LIMIT 1`, [payload.sub]);
+  if (!meRes.rowCount) {
+    res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+    return null;
+  }
+
+  const me = meRes.rows[0];
+  if (me.role !== 'admin' && me.role !== 'manager' && me.role !== 'planner') {
+    res.status(403).json({ ok: false, error: 'FORBIDDEN' });
+    return null;
+  }
+  return me;
+}
+
+// (A) 고객 계정 추가
+app.post('/customers', async (req, res) => {
+  try {
+    const me = await requireStaff(req, res);
+    if (!me) return;
+
+    const { name, email, phone, plannerNo, password } = req.body ?? {};
+
+    if (!name || !email || !phone) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+    if (!isEmail(email)) return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
+
+    const phoneDigits = onlyDigits(phone || '');
+    if (!isPhone10or11(phoneDigits)) return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
+
+    if (!password || !passwordStrong(password)) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
+
+    const existed = await query('SELECT id FROM users WHERE lower(email)=lower($1) LIMIT 1', [String(email).trim()]);
+    if (existed.rowCount) return res.status(409).json({ ok: false, error: 'EMAIL_TAKEN' });
+
+    let plannerNoInt = null;
+    if (me.role === 'planner') {
+      plannerNoInt = me.user_no;
+    } else if (plannerNo !== undefined && plannerNo !== null && String(plannerNo).trim() !== '') {
+      const pn = Number(onlyDigits(String(plannerNo)));
+      if (!Number.isFinite(pn) || pn <= 0) return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
+      plannerNoInt = pn;
+    }
+
+    const hash = await bcrypt.hash(String(password), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      if (plannerNoInt != null) await enforcePlannerCustomerLimitTx(client, plannerNoInt);
+
+      const ins = await client.query(
+        `INSERT INTO users (email, password_hash, name, role, phone, planner_no, is_active, used_bytes, file_bytes)
+         VALUES ($1,$2,$3,'user',$4,$5,false,0,$6)
+         RETURNING id, user_no, name, email, phone, planner_no, is_active, created_at, file_bytes, used_bytes`,
+        [String(email).trim(), hash, String(name).trim(), phoneDigits, plannerNoInt, DEFAULT_USER_FILE_MB],
+      );
+
+      await client.query('COMMIT');
+      return res.status(201).json({ ok: true, customer: ins.rows[0] });
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (e?.code === 'CUSTOMER_LIMIT_EXCEEDED') {
+        return res.status(403).json({ ok: false, error: 'CUSTOMER_LIMIT_EXCEEDED', detail: e?.detail || null });
+      }
+      if (e?.code === 'INVALID_PLANNER_NO') return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('[customers:POST]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// (B) 고객 수정
+app.put('/customers/:userNo', async (req, res) => {
+  try {
+    const me = await requireStaff(req, res);
+    if (!me) return;
+
+    const userNo = Number(req.params.userNo);
+    if (!Number.isFinite(userNo)) return res.status(400).json({ ok: false, error: 'INVALID_USER_NO' });
+
+    const { name, email, phone, plannerNo, is_active, password } = req.body ?? {};
+
+    const updates = [];
+    const params = [];
+    let idx = 1;
+
+    if (name !== undefined) {
+      updates.push(`name=$${idx++}`);
+      params.push(String(name).trim());
+    }
+
+    if (email !== undefined) {
+      if (!isEmail(email)) return res.status(400).json({ ok: false, error: 'INVALID_EMAIL' });
+      updates.push(`email=$${idx++}`);
+      params.push(String(email).trim());
+    }
+
+    if (phone !== undefined) {
+      const phoneDigits = onlyDigits(String(phone));
+      if (!isPhone10or11(phoneDigits)) return res.status(400).json({ ok: false, error: 'INVALID_PHONE' });
+      updates.push(`phone=$${idx++}`);
+      params.push(phoneDigits);
+    }
+
+    if (password !== undefined && String(password).trim() !== '') {
+      if (!passwordStrong(password)) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD' });
+      const hash = await bcrypt.hash(String(password), Number(process.env.BCRYPT_SALT_ROUNDS || 10));
+      updates.push(`password_hash=$${idx++}`);
+      params.push(hash);
+    }
+
+    if (plannerNo !== undefined && me.role !== 'planner') {
+      const pnRaw = String(plannerNo).trim();
+      const pn = pnRaw === '' ? null : Number(onlyDigits(pnRaw));
+      if (pnRaw !== '' && (!Number.isFinite(pn) || pn <= 0)) {
+        return res.status(400).json({ ok: false, error: 'INVALID_PLANNER_NO' });
+      }
+      updates.push(`planner_no=$${idx++}`);
+      params.push(pnRaw === '' ? null : pn);
+    }
+
+    if (is_active !== undefined) {
+      updates.push(`is_active=$${idx++}`);
+      params.push(Boolean(is_active));
+    }
+
+    if (updates.length === 0) return res.json({ ok: true });
+
+    let where = `role='user' AND user_no=$${idx}`;
+    params.push(userNo);
+    idx += 1;
+
+    if (me.role === 'planner') {
+      where += ` AND planner_no=$${idx}`;
+      params.push(me.user_no);
+      idx += 1;
+    }
+
+    const r = await query(
+      `UPDATE users
+          SET ${updates.join(', ')}, updated_at=now()
+        WHERE ${where}
+        RETURNING id, user_no, name, email, phone, planner_no, is_active, created_at`,
+      params,
+    );
+
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND_OR_NO_PERMISSION' });
+    return res.json({ ok: true, customer: r.rows[0] });
+  } catch (e) {
+    console.error('[customers:PUT]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// (C) 고객 삭제(soft delete)
+app.delete('/customers/:userNo', async (req, res) => {
+  try {
+    const me = await requireStaff(req, res);
+    if (!me) return;
+
+    const userNo = Number(req.params.userNo);
+    if (!Number.isFinite(userNo)) return res.status(400).json({ ok: false, error: 'INVALID_USER_NO' });
+
+    const params = [userNo];
+    let q = `
+      UPDATE users
+         SET is_active=false, updated_at=now()
+       WHERE role='user' AND user_no=$1
+    `;
+    if (me.role === 'planner') {
+      q += ` AND planner_no=$2`;
+      params.push(me.user_no);
+    }
+    q += ` RETURNING user_no`;
+
+    const r = await query(q, params);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND_OR_NO_PERMISSION' });
+
+    return res.json({ ok: true, user_no: r.rows[0].user_no });
+  } catch (e) {
+    console.error('[customers:DELETE]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// (D) 가입 승인
+app.put('/customers/:userNo/approve', async (req, res) => {
+  try {
+    const me = await requireStaff(req, res);
+    if (!me) return;
+
+    const userNo = Number(req.params.userNo);
+    if (!Number.isFinite(userNo)) return res.status(400).json({ ok: false, error: 'INVALID_USER_NO' });
+
+    const params = [userNo];
+    let q = `
+      UPDATE users
+         SET is_active=true, updated_at=now()
+       WHERE role='user' AND user_no=$1
+    `;
+    if (me.role === 'planner') {
+      q += ` AND planner_no=$2`;
+      params.push(me.user_no);
+    }
+    q += ` RETURNING id, user_no, is_active`;
+
+    const r = await query(q, params);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND_OR_NO_PERMISSION' });
+
+    return res.json({ ok: true, customer: r.rows[0] });
+  } catch (e) {
+    console.error('[customers:APPROVE]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// (E) 활성/비활성 토글
+app.put('/customers/:userNo/active', async (req, res) => {
+  try {
+    const me = await requireStaff(req, res);
+    if (!me) return;
+
+    const userNo = Number(req.params.userNo);
+    if (!Number.isFinite(userNo)) return res.status(400).json({ ok: false, error: 'INVALID_USER_NO' });
+
+    const nextActive = !!req.body?.is_active;
+
+    const params = [userNo, nextActive];
+    let q = `
+      UPDATE users
+         SET is_active=$2, updated_at=now()
+       WHERE role='user' AND user_no=$1
+    `;
+    if (me.role === 'planner') {
+      q += ` AND planner_no=$3`;
+      params.push(me.user_no);
+    }
+    q += ` RETURNING id, user_no, is_active`;
+
+    const r = await query(q, params);
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'USER_NOT_FOUND_OR_NO_PERMISSION' });
+
+    return res.json({ ok: true, customer: r.rows[0] });
+  } catch (e) {
+    console.error('[customers:ACTIVE]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// customer 정보 가져오기
+app.get('/customers/me', async (req, res) => {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const r = await query(
+      `
+      SELECT
+        id,
+        user_no,
+        planner_no,
+        name,
+        email,
+        phone,
+        role,
+        created_at,
+        file_bytes,
+        used_bytes
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [payload.sub],
+    );
+
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+
+    const me = r.rows[0];
+    if (me.role !== 'user') return res.status(403).json({ ok: false, error: 'FORBIDDEN' });
+
+    return res.json({ ok: true, customer: me });
+  } catch (e) {
+    console.error('[customers/me]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+});
+
+// ✅ usedbytes/add (기존 유지)
+async function handleUsedBytesAdd(req, res) {
+  try {
+    const payload = verifyTokenFromReq(req);
+    if (!payload?.sub) return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
+
+    const { addMb } = req.body ?? {};
+    const addMbNum = Number(addMb);
+    if (!Number.isFinite(addMbNum) || addMbNum <= 0) return res.status(400).json({ ok: false, error: 'INVALID_INPUT' });
+
+    const meRes = await query(`SELECT id, role, user_no FROM users WHERE id = $1 LIMIT 1`, [payload.sub]);
+    if (!meRes.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+    const me = meRes.rows[0];
+
+    if (me.role !== 'planner' && me.role !== 'admin' && me.role !== 'manager') {
+      return res.status(403).json({ ok: false, error: 'FORBIDDEN_ROLE' });
+    }
+
+    const r = await query(
+      `
+      UPDATE users
+      SET used_bytes = COALESCE(used_bytes, 0) + $2
+      WHERE id = $1
+      RETURNING id, user_no, file_bytes, used_bytes
+      `,
+      [me.id, addMbNum],
+    );
+
+    if (!r.rowCount) return res.status(404).json({ ok: false, error: 'ME_NOT_FOUND' });
+
+    const updated = r.rows[0];
+    return res.json({
+      ok: true,
+      customer: { id: updated.id, user_no: updated.user_no, file_bytes: updated.file_bytes, used_bytes: updated.used_bytes },
+    });
+  } catch (e) {
+    console.error('[usedbytes/add]', e);
+    return res.status(500).json({ ok: false, error: 'SERVER_ERROR' });
+  }
+}
+app.post('/customers/usedbytes/add', handleUsedBytesAdd);
+app.post('/auth/usedbytes/add', handleUsedBytesAdd);
+
+// ✅ [2026-02-25] FIX: server.listen은 "모든 라우트 등록 후" 파일 맨 아래에서 실행
+server.listen(PORT, () => {
+  console.log(`HTTP+WS signaling up: http://0.0.0.0:${PORT}`);
 });
